@@ -1,0 +1,326 @@
+// ============================================================================
+// Bullion Trading Platform — Core Schema
+// PostgreSQL via Prisma. All monetary/weight fields use Decimal to avoid
+// float rounding errors on gram-level and paisa-level precision.
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Identity & KYC
+// ---------------------------------------------------------------------------
+
+enum KycStatus {
+  PENDING
+  VERIFIED
+  REJECTED
+  EXPIRED
+}
+
+enum EntityType {
+  JEWELLER
+  MANUFACTURER
+  TRADER
+  REFINER
+  BANK
+  ADMIN
+}
+
+model Entity {
+  id                  String    @id @default(uuid())
+  legalName           String
+  entityType          EntityType
+  gstin               String?   @unique
+  pan                 String    @unique
+  bisHallmarkLicense  String?   // required for refiners / bar issuers
+  kycStatus           KycStatus @default(PENDING)
+  kycVerifiedAt        DateTime?
+  creditLimitInr      Decimal   @default(0) @db.Decimal(18, 2)
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  users               User[]
+  virtualAccounts     VirtualAccount[]
+  orders              Order[]
+  inventoryBars       InventoryBar[] // bars an entity (refiner) has issued/owns
+
+  @@index([entityType])
+  @@index([kycStatus])
+}
+
+model User {
+  id           String   @id @default(uuid())
+  entityId     String
+  entity       Entity   @relation(fields: [entityId], references: [id])
+  email        String   @unique
+  phone        String   @unique
+  passwordHash String
+  role         String   @default("TRADER") // TRADER, ENTITY_ADMIN, PLATFORM_ADMIN
+  mfaEnabled   Boolean  @default(false)
+  createdAt    DateTime @default(now())
+
+  orders       Order[]
+  rateLocks    RateLockAudit[]
+
+  @@index([entityId])
+}
+
+// ---------------------------------------------------------------------------
+// Virtual Account Clearing (pre-funded model)
+// ---------------------------------------------------------------------------
+
+enum VanStatus {
+  ACTIVE
+  SUSPENDED
+  CLOSED
+}
+
+model VirtualAccount {
+  id                String    @id @default(uuid())
+  entityId          String
+  entity            Entity    @relation(fields: [entityId], references: [id])
+  vanNumber         String    @unique // partner-bank issued virtual account number
+  ifsc              String
+  partnerBank       String    // ICICI | HDFC | AXIS
+  availableFloatInr Decimal   @default(0) @db.Decimal(18, 2)
+  ledgerBalanceInr  Decimal   @default(0) @db.Decimal(18, 2)
+  status            VanStatus @default(ACTIVE)
+  createdAt         DateTime  @default(now())
+
+  settlements       Settlement[]
+
+  @@index([entityId])
+  @@index([vanNumber])
+}
+
+enum SettlementStatus {
+  RECEIVED
+  VERIFIED
+  REJECTED_SIGNATURE
+  REJECTED_AMOUNT_MISMATCH
+  RECONCILED
+}
+
+// Raw webhook ledger — every inbound bank callback is stored, verified or not,
+// for audit/replay-protection purposes before it's allowed to move an Order.
+model Settlement {
+  id                String            @id @default(uuid())
+  virtualAccountId  String
+  virtualAccount    VirtualAccount    @relation(fields: [virtualAccountId], references: [id])
+  bankRefNumber     String            @unique // idempotency / replay-protection key
+  amountInr         Decimal           @db.Decimal(18, 2)
+  utrNumber         String?
+  rawPayload        Json
+  signatureValid    Boolean
+  status            SettlementStatus  @default(RECEIVED)
+  orderId           String?
+  order             Order?            @relation(fields: [orderId], references: [id])
+  receivedAt        DateTime          @default(now())
+  reconciledAt      DateTime?
+
+  @@index([virtualAccountId])
+  @@index([orderId])
+}
+
+// ---------------------------------------------------------------------------
+// Orders — the central state machine
+// ---------------------------------------------------------------------------
+
+enum Metal {
+  GOLD
+  SILVER
+}
+
+enum OrderStatus {
+  PENDING_LOCK
+  LOCKED
+  FUNDED
+  AWAITING_MARKET_OPEN // one or more hedge legs queued; MCX closed at fund time
+  HEDGED
+  HEDGE_FAILED // a hedge leg was rejected (circuit limit, margin block, etc.) — treasury alert
+  DISPATCHED
+  COMPLETED
+  CANCELLED
+  LOCK_EXPIRED
+}
+
+model Order {
+  id                String       @id @default(uuid())
+  entityId          String
+  entity            Entity       @relation(fields: [entityId], references: [id])
+  userId            String
+  user              User         @relation(fields: [userId], references: [id])
+
+  metal             Metal
+  volumeGrams       Decimal      @db.Decimal(12, 4)
+
+  // Pricing snapshot — frozen at lock time, never recomputed after LOCKED
+  baseSpotUsdPerOz  Decimal      @db.Decimal(12, 4)
+  usdInrRate        Decimal      @db.Decimal(10, 4)
+  customsDutyFactor Decimal      @db.Decimal(6, 4)
+  refinerPremiumInr Decimal      @db.Decimal(12, 4) // per gram
+  platformMarkupBps Int          // 20-30 bps per spec
+  lockedRatePerGram Decimal      @db.Decimal(12, 4) // fully computed ask price/gram
+
+  grossAmountInr    Decimal      @db.Decimal(18, 2)
+  gstAmountInr      Decimal      @db.Decimal(18, 2) // 3% per HSN 7108/7106
+  tcsAmountInr      Decimal      @db.Decimal(18, 2) // Section 206C(1H)
+  courierChargeInr  Decimal      @default(0) @db.Decimal(18, 2)
+  netPayableInr     Decimal      @db.Decimal(18, 2)
+
+  quoteId           String       // ties back to the tick that was locked
+  lockToken         String?      @unique // Redis lock token, cleared once committed
+  lockExpiresAt     DateTime?
+
+  status            OrderStatus  @default(PENDING_LOCK)
+
+  hedgingPositions  HedgingPosition[]
+  settlements       Settlement[]
+  logistics         LogisticsRecord?
+  statusHistory     OrderStatusEvent[]
+
+  createdAt         DateTime     @default(now())
+  updatedAt         DateTime     @updatedAt
+
+  @@index([entityId])
+  @@index([status])
+  @@index([quoteId])
+}
+
+// Immutable audit trail of every state transition — required for PMLA/FIU-IND
+// and general dispute resolution.
+model OrderStatusEvent {
+  id        String      @id @default(uuid())
+  orderId   String
+  order     Order       @relation(fields: [orderId], references: [id])
+  fromStatus OrderStatus?
+  toStatus  OrderStatus
+  reason    String?
+  actor     String      // system component or user id that caused the transition
+  createdAt DateTime    @default(now())
+
+  @@index([orderId])
+}
+
+// Audit record of every lock attempt (including ones that expired unused),
+// separate from Order so we retain lock telemetry even for abandoned quotes.
+model RateLockAudit {
+  id          String   @id @default(uuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id])
+  quoteId     String
+  volumeGrams Decimal  @db.Decimal(12, 4)
+  lockToken   String   @unique
+  ratePerGram Decimal  @db.Decimal(12, 4)
+  acquiredAt  DateTime @default(now())
+  expiresAt   DateTime
+  committed   Boolean  @default(false)
+  committedAt DateTime?
+
+  @@index([userId])
+  @@index([quoteId])
+}
+
+// ---------------------------------------------------------------------------
+// Physical Inventory
+// ---------------------------------------------------------------------------
+
+enum Fineness {
+  F999_0
+  F999_9
+}
+
+model InventoryBar {
+  id                String    @id @default(uuid())
+  serialNumber      String    @unique
+  weightGrams       Decimal   @db.Decimal(12, 4)
+  fineness          Fineness
+  refinerEntityId   String
+  refinerEntity     Entity    @relation(fields: [refinerEntityId], references: [id])
+  vaultLocation     String
+  bisHallmarkId     String
+  allocatedToOrderId String?  @unique
+  isAllocated       Boolean   @default(false)
+  createdAt         DateTime  @default(now())
+
+  @@index([refinerEntityId])
+  @@index([vaultLocation])
+}
+
+// ---------------------------------------------------------------------------
+// Delta Hedging
+// ---------------------------------------------------------------------------
+
+enum HedgeStatus {
+  PENDING
+  SUBMITTED
+  QUEUED_AMO // MCX closed at placement time; parked for release at next market open
+  FILLED
+  PARTIALLY_FILLED
+  REJECTED
+  CANCELLED
+}
+
+model HedgingPosition {
+  id                   String      @id @default(uuid())
+  orderId              String
+  order                Order       @relation(fields: [orderId], references: [id])
+  broker               String      // ZERODHA_KITE | KOTAK_NEO | FIX_GENERIC
+  brokerOrderId        String?
+  contractType         String      // e.g. GOLDM, GOLDPETAL, GOLD1KG (MCX contract codes)
+  lots                 Decimal     @db.Decimal(10, 2)
+  side                 String      @default("SELL")
+  executionPrice       Decimal?    @db.Decimal(12, 4) // avgPrice once filled
+  transactionChargesInr Decimal?   @db.Decimal(12, 4)
+  status               HedgeStatus @default(PENDING)
+  amoScheduledFor      DateTime?   // when status = QUEUED_AMO
+  submittedAt          DateTime?
+  filledAt             DateTime?
+  errorDetail          String?
+  createdAt            DateTime    @default(now())
+
+  @@index([orderId])
+  @@index([status])
+}
+
+// ---------------------------------------------------------------------------
+// Logistics & Vault Custody
+// ---------------------------------------------------------------------------
+
+enum LogisticsMode {
+  ARMORED_TRANSIT
+  VAULT_CUSTODY_HOLD
+}
+
+enum LogisticsStatus {
+  AWAITING_DISPATCH
+  EWAY_BILL_GENERATED
+  IN_TRANSIT
+  OTP_PENDING_DELIVERY
+  DELIVERED
+  VAULT_ALLOCATED
+  FAILED
+}
+
+model LogisticsRecord {
+  id              String          @id @default(uuid())
+  orderId         String          @unique
+  order           Order           @relation(fields: [orderId], references: [id])
+  mode            LogisticsMode
+  carrier         String?         // SEQUEL_LOGISTICS | BVC — null for vault hold
+  ewayBillNumber  String?
+  deliveryOtpHash String?
+  status          LogisticsStatus @default(AWAITING_DISPATCH)
+  vaultLocation   String?         // set when mode = VAULT_CUSTODY_HOLD
+  deliveredAt     DateTime?
+  createdAt       DateTime        @default(now())
+
+  @@index([status])
+}

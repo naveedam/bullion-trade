@@ -1,0 +1,61 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@import url("https://fonts.googleapis.com/css2?family=Libre+Franklin:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap");
+
+/* ---------------------------------------------------------------------
+   Design tokens
+   Base: warm graphite (not pure black) — references vault/ingot tones.
+   Accent: muted antique gold and tarnished-silver, drawn from the metals
+   themselves rather than a generic brand accent.
+   --------------------------------------------------------------------- */
+:root {
+  --graphite-950: #14140f;
+  --graphite-900: #1b1b15;
+  --graphite-800: #26261d;
+  --graphite-700: #353426;
+  --hairline: #3d3c2e;
+
+  --parchment: #efe9db;
+  --parchment-dim: #a6a190;
+
+  --bullion-gold: #c9a24b;
+  --bullion-gold-dim: #8a7038;
+  --silver-tone: #b7bdc4;
+
+  --verified-green: #6a8f74;
+  --alert-red: #b3543a;
+
+  --font-display: "Libre Franklin", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, monospace;
+}
+
+html,
+body {
+  background: var(--graphite-950);
+  color: var(--parchment);
+  font-family: var(--font-display);
+}
+
+.font-numeric {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+::selection {
+  background: var(--bullion-gold-dim);
+  color: var(--graphite-950);
+}
+
+:focus-visible {
+  outline: 2px solid var(--bullion-gold);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
