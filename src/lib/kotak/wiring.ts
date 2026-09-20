@@ -29,48 +29,52 @@ async function isHolidayIst(dateIst: Date): Promise<boolean> {
 
 const marketHoursConfig: McxMarketHoursConfig = { isHolidayIst };
 
-export function buildKotakNeoAdapter(): KotakNeoHedgeAdapter {
-  const redis = getRedis();
-
-  const authClient = new KotakNeoAuthClient(
+function buildAuthClient(): KotakNeoAuthClient {
+  return new KotakNeoAuthClient(
     {
       consumerKey: requireEnv("KOTAK_CONSUMER_KEY"),
-      consumerSecret: requireEnv("KOTAK_CONSUMER_SECRET"),
       mobileNumber: requireEnv("KOTAK_MOBILE_NUMBER"),
-      password: requireEnv("KOTAK_PASSWORD"),
-      totpSecret: requireEnv("KOTAK_TOTP_SECRET"),
-      baseUrl: process.env.KOTAK_API_BASE_URL,
+      ucc: requireEnv("KOTAK_UCC"),
+      mpin: requireEnv("KOTAK_MPIN"),
     },
-    redis
+    getRedis()
   );
+}
 
-  const instrumentResolver = new InstrumentResolver(
-    {
-      masterScripUrl: process.env.KOTAK_MASTER_SCRIP_URL,
-      bearerTokenProvider: async () => (await authClient.getValidSession()).bearerToken,
-    },
-    redis
+function buildInstrumentResolver(authClient: KotakNeoAuthClient): InstrumentResolver {
+  return new InstrumentResolver(
+    authClient,
+    { tenderNoticeDays: process.env.KOTAK_TENDER_NOTICE_DAYS ? Number(process.env.KOTAK_TENDER_NOTICE_DAYS) : undefined },
+    getRedis()
   );
+}
+
+/**
+ * Shared by both the hedge-execution path (kotakNeoAdapter.ts) and the
+ * MCX pricing path (mcxPricingService.ts) — one auth client + resolver
+ * pair per process rather than each building its own.
+ */
+export function buildKotakPricingGraph(): {
+  authClient: KotakNeoAuthClient;
+  instrumentResolver: InstrumentResolver;
+} {
+  const authClient = buildAuthClient();
+  return { authClient, instrumentResolver: buildInstrumentResolver(authClient) };
+}
+
+export function buildKotakNeoAdapter(): KotakNeoHedgeAdapter {
+  const redis = getRedis();
+  const authClient = buildAuthClient();
+  const instrumentResolver = buildInstrumentResolver(authClient);
 
   return new KotakNeoHedgeAdapter(authClient, instrumentResolver, redis, {
-    baseUrl: process.env.KOTAK_API_BASE_URL,
     useNativeAmo: process.env.KOTAK_USE_NATIVE_AMO === "true",
     marketHours: marketHoursConfig,
   });
 }
 
 export function buildAuthClientForHealthCheck(): KotakNeoAuthClient {
-  return new KotakNeoAuthClient(
-    {
-      consumerKey: requireEnv("KOTAK_CONSUMER_KEY"),
-      consumerSecret: requireEnv("KOTAK_CONSUMER_SECRET"),
-      mobileNumber: requireEnv("KOTAK_MOBILE_NUMBER"),
-      password: requireEnv("KOTAK_PASSWORD"),
-      totpSecret: requireEnv("KOTAK_TOTP_SECRET"),
-      baseUrl: process.env.KOTAK_API_BASE_URL,
-    },
-    getRedis()
-  );
+  return buildAuthClient();
 }
 
 export { getRedis };

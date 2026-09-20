@@ -1,57 +1,57 @@
 /**
  * MCX Instrument Master & Token Resolver
  * ---------------------------------------------------------------------------
- * Kotak Neo publishes a per-segment scrip master (commonly a CSV, refreshed
- * once daily before market open) listing every tradable instrument on that
- * segment along with its `instrumentToken`, `tradingSymbol`, lot size, and
- * expiry. This module downloads that file for the `mcx_fo` segment, parses
- * it, and resolves each of our logical `HedgeContractType`s to the specific
- * contract we should actually be sending orders against today.
+ * Rewritten against OptionPal Pro's verified kotak-scrip-master
+ * implementation. Two corrections from the first draft:
  *
- * "Active, most liquid near-month" resolution rule used here:
- *   1. Filter to rows whose base symbol matches (GOLD / GOLDM / GOLDPETAL)
- *      and instrument type is FUTCOM (commodity future).
- *   2. Drop any contract that has already entered its tender/delivery
- *      period — once a compulsory-delivery contract enters tender, trading
- *      volume collapses and the price can decouple from spot, so hedging
- *      against it defeats the purpose. Tender start is modelled as
- *      `expiryDate - tenderNoticeDays`; MCX publishes the exact tender
- *      start date per contract in its contract specification circular —
- *      the calendar-offset approximation here is a fallback and should be
- *      replaced with the exchange's published date wherever the master
- *      file (or a synced circular table) provides it directly.
- *   3. Among what's left, pick the soonest-expiring contract (near-month)
- *      as the liquidity proxy — near-month is conventionally the most
- *      liquid MCX gold contract outside of contract-roll week.
+ *   1. This is a TWO-STEP fetch, not a direct CSV URL:
+ *        Step 1 - GET {tradingBaseUrl}/script-details/1.0/masterscrip/file-paths
+ *                 headers: Authorization: Bearer <accessToken>, sid, neo-fin-key
+ *                 -> { filesPaths: [{ path/filePath/url, ... }, ...] }
+ *        Step 2 - GET whichever returned path contains "mcx_fo" (no auth
+ *                 headers needed for this one - it's a direct CSV download
+ *                 off a file host, per OptionPal Pro's own working code).
+ *      There is no fixed, guessable CSV URL - it's issued per-session by
+ *      step 1 and can change.
+ *   2. There's no clean instrument_type / symbol column to rely on.
+ *      OptionPal Pro's real CSV has unpredictable, broker-internal column
+ *      names (their code fuzzy-matches headers by substring - "token",
+ *      "psymbol", "ptrdsymbol", etc. - because the exact names aren't
+ *      documented anywhere they could find). The same approach is used
+ *      here. Row identification for a specific contract (GOLD vs GOLDM vs
+ *      GOLDPETAL) then can't rely on a clean base-symbol column either -
+ *      it has to pattern-match the trading-symbol-like column directly,
+ *      which is genuinely ambiguous: "GOLD" is a string-prefix of
+ *      "GOLDM", "GOLDPETAL", and "GOLDGUINEA" alike. The regex below
+ *      requires the base symbol to be followed immediately by a digit
+ *      (the start of the expiry date, e.g. "GOLD25FEBFUT" vs
+ *      "GOLDM25FEBFUT") to disambiguate - a reasonable but NOT verified
+ *      heuristic, since OptionPal Pro never exercised mcx_fo rows.
  *
- * The resolved instrument set is cached in Redis with a TTL tied to the
- * master file's own daily refresh cadence, so repeated hedge triggers
- * within a trading day don't re-download and re-parse the master file on
- * every single order.
+ * If resolution fails, the error includes the actual CSV header row seen,
+ * specifically so a real run against a real MCX file can be diagnosed and
+ * the column matchers adjusted quickly, rather than guessing blind again.
  */
 
 import type Redis from "ioredis";
 import type { HedgeContractType, ResolvedInstrument } from "./types";
 import { HEDGE_CONTRACT_SPECS } from "./types";
+import type { KotakNeoAuthClient } from "./neoAuth";
 
 const REDIS_KEY_PREFIX = "kotak:neo:instrument:";
-const CACHE_TTL_SECONDS = 12 * 60 * 60; // half a trading day; master refreshes daily
+const CACHE_TTL_SECONDS = 12 * 60 * 60;
 const DEFAULT_TENDER_NOTICE_DAYS = 5;
+const SCRIP_MASTER_PATHS_ENDPOINT = "script-details/1.0/masterscrip/file-paths";
 
 interface RawScripRow {
   tradingSymbol: string;
   instrumentToken: string;
-  exchangeSegment: string;
-  instrumentType: string;
-  baseSymbol: string; // parsed out of tradingSymbol / a dedicated column if present
-  expiryDate: string; // ISO
+  expiryDate: string;
   lotSize: number;
 }
 
 export interface InstrumentResolverConfig {
-  masterScripUrl?: string; // e.g. "https://gw-napi.kotaksecurities.com/masterscrip/mcx_fo.csv"
   tenderNoticeDays?: number;
-  bearerTokenProvider: () => Promise<string>;
 }
 
 export class InstrumentResolutionError extends Error {
@@ -62,16 +62,13 @@ export class InstrumentResolutionError extends Error {
 }
 
 export class InstrumentResolver {
-  private readonly masterScripUrl: string;
   private readonly tenderNoticeDays: number;
 
   constructor(
-    private readonly config: InstrumentResolverConfig,
+    private readonly authClient: KotakNeoAuthClient,
+    config: InstrumentResolverConfig,
     private readonly redis: Redis
   ) {
-    this.masterScripUrl =
-      config.masterScripUrl ??
-      "https://gw-napi.kotaksecurities.com/masterscrip/mcx_fo.csv";
     this.tenderNoticeDays = config.tenderNoticeDays ?? DEFAULT_TENDER_NOTICE_DAYS;
   }
 
@@ -82,24 +79,28 @@ export class InstrumentResolver {
     const rows = await this.fetchAndParseMaster();
     const spec = HEDGE_CONTRACT_SPECS[hedgeContractType];
 
+    const symbolPattern = new RegExp(`^${escapeRegExp(spec.baseSymbol)}\\d`);
+    const isFuture = (tradingSymbol: string) => tradingSymbol.toUpperCase().endsWith("FUT");
+
     const candidates = rows.filter(
       (r) =>
-        r.baseSymbol === spec.baseSymbol &&
-        r.instrumentType === "FUTCOM" &&
+        symbolPattern.test(r.tradingSymbol.toUpperCase()) &&
+        isFuture(r.tradingSymbol) &&
         new Date(r.expiryDate).getTime() > Date.now()
     );
 
     if (candidates.length === 0) {
       throw new InstrumentResolutionError(
-        `No live futures contract found for ${hedgeContractType} (base symbol ${spec.baseSymbol}) in the master scrip file`
+        `No live futures contract found for ${hedgeContractType} (base symbol ${spec.baseSymbol}) in the mcx_fo master scrip file. ` +
+          `This most likely means the column-matching or symbol-pattern heuristics in this file don't match the real CSV format - ` +
+          `check a sample row from the actual mcx_fo file and adjust parseMasterScripCsv() / the symbolPattern regex above.`
       );
     }
 
     const now = Date.now();
     const nonTender = candidates.filter((r) => {
       const tenderStart =
-        new Date(r.expiryDate).getTime() -
-        this.tenderNoticeDays * 24 * 60 * 60 * 1000;
+        new Date(r.expiryDate).getTime() - this.tenderNoticeDays * 24 * 60 * 60 * 1000;
       return now < tenderStart;
     });
 
@@ -111,9 +112,7 @@ export class InstrumentResolver {
       );
     }
 
-    pool.sort(
-      (a, b) => new Date(a.expiryDate).getTime() - new Date(b.expiryDate).getTime()
-    );
+    pool.sort((a, b) => new Date(a.expiryDate).getTime() - new Date(b.expiryDate).getTime());
     const chosen = pool[0];
 
     const resolved: ResolvedInstrument = {
@@ -125,8 +124,7 @@ export class InstrumentResolver {
       multiplierGrams: spec.multiplierGrams,
       expiryDate: chosen.expiryDate,
       tenderPeriodStart: new Date(
-        new Date(chosen.expiryDate).getTime() -
-          this.tenderNoticeDays * 24 * 60 * 60 * 1000
+        new Date(chosen.expiryDate).getTime() - this.tenderNoticeDays * 24 * 60 * 60 * 1000
       ).toISOString(),
       resolvedAt: new Date(),
     };
@@ -146,9 +144,6 @@ export class InstrumentResolver {
     if (!raw) return null;
     try {
       const parsed = JSON.parse(raw) as ResolvedInstrument;
-      // Never serve a cached contract past its tender start, even if the
-      // Redis TTL hasn't lapsed yet — the tender boundary is a hard business
-      // rule, not just a cache-freshness concern.
       if (new Date(parsed.tenderPeriodStart).getTime() <= Date.now()) {
         return null;
       }
@@ -171,96 +166,142 @@ export class InstrumentResolver {
   }
 
   private async fetchAndParseMaster(): Promise<RawScripRow[]> {
-    const bearerToken = await this.config.bearerTokenProvider();
+    const session = await this.authClient.getValidSession();
 
-    let response: Response;
+    let pathsResponse: Response;
     try {
-      response = await fetch(this.masterScripUrl, {
-        headers: { Authorization: `Bearer ${bearerToken}` },
+      pathsResponse = await fetch(`${session.tradingBaseUrl}/${SCRIP_MASTER_PATHS_ENDPOINT}`, {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${session.accessToken}`,
+          "neo-fin-key": "neotradeapi",
+          sid: session.sid,
+        },
       });
     } catch (err) {
       throw new InstrumentResolutionError(
-        `Network error fetching master scrip file: ${
+        `Network error fetching scrip master file paths: ${
           err instanceof Error ? err.message : String(err)
         }`
       );
     }
 
-    if (!response.ok) {
+    if (!pathsResponse.ok) {
       throw new InstrumentResolutionError(
-        `Master scrip fetch failed: HTTP ${response.status}`
+        `Scrip master file-paths request failed: HTTP ${pathsResponse.status}`
       );
     }
 
-    const csv = await response.text();
+    const pathsData = (await pathsResponse.json().catch(() => null)) as {
+      filesPaths?: unknown[];
+      data?: { filesPaths?: unknown[] };
+      result?: unknown[];
+    } | null;
+
+    const fileList = pathsData?.filesPaths ?? pathsData?.data?.filesPaths ?? pathsData?.result ?? [];
+
+    let mcxCsvUrl = "";
+    if (Array.isArray(fileList)) {
+      for (const item of fileList) {
+        const entry = item as { path?: string; filePath?: string; url?: string };
+        const path = entry?.path ?? entry?.filePath ?? entry?.url ?? "";
+        if (typeof path === "string" && path.includes("mcx_fo")) {
+          mcxCsvUrl = path;
+          break;
+        }
+      }
+    }
+
+    if (!mcxCsvUrl) {
+      throw new InstrumentResolutionError(
+        `No "mcx_fo" entry found in the scrip master file-paths response: ${JSON.stringify(
+          pathsData
+        ).slice(0, 500)}`
+      );
+    }
+
+    let csvResponse: Response;
+    try {
+      csvResponse = await fetch(mcxCsvUrl);
+    } catch (err) {
+      throw new InstrumentResolutionError(
+        `Network error downloading mcx_fo scrip master CSV: ${
+          err instanceof Error ? err.message : String(err)
+        }`
+      );
+    }
+
+    if (!csvResponse.ok) {
+      throw new InstrumentResolutionError(
+        `mcx_fo scrip master CSV download failed: HTTP ${csvResponse.status}`
+      );
+    }
+
+    const csv = await csvResponse.text();
     return parseMasterScripCsv(csv);
   }
 }
 
-/**
- * Minimal CSV parser for the master scrip file. Assumes the broker's export
- * has no embedded commas/quotes within fields (typical for scrip masters,
- * which are machine-generated with plain alphanumeric fields) — if that
- * assumption doesn't hold for your actual export, swap this for a proper
- * CSV library (e.g. papaparse) rather than hardening this by hand.
- *
- * Expected columns (header row, order-independent, matched by name):
- *   trading_symbol, instrument_token, exchange_segment, instrument_type,
- *   symbol, expiry, lot_size
- */
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 export function parseMasterScripCsv(csv: string): RawScripRow[] {
   const lines = csv.trim().split(/\r?\n/);
   if (lines.length < 2) return [];
 
-  const header = lines[0].split(",").map((h) => h.trim().toLowerCase());
-  const col = (name: string) => header.indexOf(name);
+  const headerLine = lines[0]?.toLowerCase() ?? "";
+  const cols = headerLine.split(",");
 
-  const idx = {
-    tradingSymbol: col("trading_symbol"),
-    instrumentToken: col("instrument_token"),
-    exchangeSegment: col("exchange_segment"),
-    instrumentType: col("instrument_type"),
-    symbol: col("symbol"),
-    expiry: col("expiry"),
-    lotSize: col("lot_size"),
-  };
+  const tokenIdx = cols.findIndex(
+    (h) => h.includes("token") || h.includes("instrument_token") || h.includes("psymbol")
+  );
+  // Excludes tokenIdx explicitly — a column like "pSymbol" can satisfy
+  // both this pattern and the token pattern above (it contains both
+  // "symbol" and, literally, "psymbol"), so without this exclusion the
+  // two fields collide on the same column. Caught by a smoke test against
+  // a synthetic CSV using that exact header style.
+  const symbolIdx = cols.findIndex(
+    (h, i) =>
+      i !== tokenIdx &&
+      (h.includes("symbol") || h.includes("trading_symbol") || h.includes("ptrdsymbol"))
+  );
+  const expiryIdx = cols.findIndex(
+    (h) => h.includes("expiry") || h.includes("pexpirydate") || h.includes("dexpiry")
+  );
+  const lotSizeIdx = cols.findIndex(
+    (h) => h.includes("lot") || h.includes("lotsize") || h.includes("boardlotqty")
+  );
 
-  const missing = Object.entries(idx)
-    .filter(([, i]) => i === -1)
-    .map(([name]) => name);
-  if (missing.length > 0) {
+  if (tokenIdx < 0 || symbolIdx < 0 || expiryIdx < 0) {
     throw new InstrumentResolutionError(
-      `Master scrip CSV is missing expected column(s): ${missing.join(", ")} — verify the export format against the current API docs`
+      `Could not find token/symbol/expiry columns in the mcx_fo CSV header. Header row seen: "${lines[0]}"`
     );
   }
 
   const rows: RawScripRow[] = [];
   for (let i = 1; i < lines.length; i++) {
-    const cells = lines[i].split(",");
-    if (cells.length < header.length) continue;
+    const row = lines[i].split(",");
+    if (row.length <= Math.max(tokenIdx, symbolIdx, expiryIdx)) continue;
 
-    const exchangeSegment = cells[idx.exchangeSegment]?.trim().toLowerCase();
-    if (exchangeSegment !== "mcx_fo") continue;
+    const tradingSymbol = row[symbolIdx]?.trim().toUpperCase() ?? "";
+    const instrumentToken = row[tokenIdx]?.trim() ?? "";
+    const expiryRaw = row[expiryIdx]?.trim() ?? "";
+    const lotSize = lotSizeIdx >= 0 ? parseInt(row[lotSizeIdx] ?? "0", 10) : 0;
 
-    rows.push({
-      tradingSymbol: cells[idx.tradingSymbol]?.trim(),
-      instrumentToken: cells[idx.instrumentToken]?.trim(),
-      exchangeSegment,
-      instrumentType: cells[idx.instrumentType]?.trim().toUpperCase(),
-      baseSymbol: cells[idx.symbol]?.trim().toUpperCase(),
-      expiryDate: normalizeExpiry(cells[idx.expiry]?.trim()),
-      lotSize: Number(cells[idx.lotSize]?.trim()),
-    });
+    if (!tradingSymbol || !instrumentToken || !expiryRaw) continue;
+
+    const expiryDate = normalizeExpiry(expiryRaw);
+    if (!expiryDate) continue;
+
+    rows.push({ tradingSymbol, instrumentToken, expiryDate, lotSize });
   }
+
   return rows;
 }
 
-function normalizeExpiry(raw: string): string {
-  // Master files commonly express expiry as DD-MMM-YYYY (e.g. "26-FEB-2026").
-  // Normalize to ISO so downstream Date comparisons are unambiguous.
+function normalizeExpiry(raw: string): string | null {
   const parsed = new Date(raw);
-  if (Number.isNaN(parsed.getTime())) {
-    throw new InstrumentResolutionError(`Unparseable expiry date: "${raw}"`);
-  }
+  if (Number.isNaN(parsed.getTime())) return null;
   return parsed.toISOString();
 }

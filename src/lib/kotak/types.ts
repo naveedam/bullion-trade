@@ -14,11 +14,32 @@ export type HedgeContractType =
 
 export const HEDGE_CONTRACT_SPECS: Record<
   HedgeContractType,
-  { baseSymbol: string; multiplierGrams: Decimal }
+  { baseSymbol: string; multiplierGrams: Decimal; quotationUnitGrams: Decimal }
 > = {
-  MCX_GOLD_1KG: { baseSymbol: "GOLD", multiplierGrams: new Decimal(1000) },
-  MCX_GOLD_MINI_100G: { baseSymbol: "GOLDM", multiplierGrams: new Decimal(100) },
-  MCX_GOLD_PETAL_1G: { baseSymbol: "GOLDPETAL", multiplierGrams: new Decimal(1) },
+  // quotationUnitGrams is NOT the same as multiplierGrams (lot size) — MCX
+  // quotes GOLD and GOLDM both per 10 grams even though their lot sizes
+  // differ (1000g vs 100g). Dividing the raw LTP by the wrong constant here
+  // silently misprices by 10x or 100x, so this is kept as an explicit,
+  // separately-named field rather than derived from lot size. Confirmed
+  // against MCX's published contract specifications (Sept 2026):
+  //   GOLD (1kg)      -> LTP quoted per 10g
+  //   GOLDM (100g)    -> LTP quoted per 10g
+  //   GOLDPETAL (1g)  -> LTP quoted per 1g
+  MCX_GOLD_1KG: {
+    baseSymbol: "GOLD",
+    multiplierGrams: new Decimal(1000),
+    quotationUnitGrams: new Decimal(10),
+  },
+  MCX_GOLD_MINI_100G: {
+    baseSymbol: "GOLDM",
+    multiplierGrams: new Decimal(100),
+    quotationUnitGrams: new Decimal(10),
+  },
+  MCX_GOLD_PETAL_1G: {
+    baseSymbol: "GOLDPETAL",
+    multiplierGrams: new Decimal(1),
+    quotationUnitGrams: new Decimal(1),
+  },
 };
 
 /** A resolved, tradable instrument for a given logical contract type. */
@@ -69,4 +90,14 @@ export interface KotakFillResult {
   filledQuantity?: number;
   transactionCharges?: Decimal;
   rejectReason?: string;
+}
+
+/** A live LTP quote for a resolved instrument, used as the pricing reference. */
+export interface LtpQuote {
+  instrumentToken: string;
+  tradingSymbol: string;
+  ltp: Decimal;
+  bid?: Decimal;
+  ask?: Decimal;
+  fetchedAt: Date;
 }

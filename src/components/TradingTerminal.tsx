@@ -9,6 +9,7 @@ import { VanPaymentPanel } from "./VanPaymentPanel";
 interface TickSnapshot {
   metal: "GOLD" | "SILVER";
   quoteId: string;
+  priceSource: "MCX" | "LBMA_FX";
   baseSpotPerGramInr: string;
   customsAdjustedPerGramInr: string;
   refinerPremiumInr: string;
@@ -16,6 +17,8 @@ interface TickSnapshot {
   askPricePerGramInr: string;
   baseSpotUsdPerOz: string;
   usdInrRate: string;
+  mcxTradingSymbol?: string;
+  mcxLtp?: string;
   generatedAt: string;
   stale: boolean;
 }
@@ -154,13 +157,22 @@ export function TradingTerminal() {
         </div>
         <div className="text-right">
           <p className="text-xs text-parchment-dim">
-            Live spot{displayTick?.stale ? " (last known)" : ""}
+            {displayTick?.priceSource === "MCX"
+              ? `MCX ${displayTick.mcxTradingSymbol ?? ""}`
+              : "Live spot"}
+            {displayTick?.stale ? " (last known)" : ""}
           </p>
           {displayTick ? (
-            <p className="font-numeric text-sm text-bullion-silver">
-              ${Number(displayTick.baseSpotUsdPerOz).toFixed(2)} / oz · ₹
-              {Number(displayTick.usdInrRate).toFixed(3)}
-            </p>
+            displayTick.priceSource === "MCX" ? (
+              <p className="font-numeric text-sm text-bullion-silver">
+                ₹{Number(displayTick.mcxLtp).toLocaleString("en-IN")} / 10g
+              </p>
+            ) : (
+              <p className="font-numeric text-sm text-bullion-silver">
+                ${Number(displayTick.baseSpotUsdPerOz).toFixed(2)} / oz · ₹
+                {Number(displayTick.usdInrRate).toFixed(3)}
+              </p>
+            )
           ) : (
             <p className="font-numeric text-sm text-parchment-dim">
               {tickError ?? "Loading…"}
