@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getCurrentTick } from "../../../lib/tickService";
-import { getRedis } from "../../../lib/redis";
+import { getRedis, RedisNotConfiguredError } from "../../../lib/redis";
 import { MarketFeedError } from "../../../lib/marketFeed";
 
 /**
@@ -23,6 +23,9 @@ export async function GET(req: NextRequest) {
     const tick = await getCurrentTick(getRedis(), metalParam);
     return NextResponse.json(tick);
   } catch (err) {
+    if (err instanceof RedisNotConfiguredError) {
+      return NextResponse.json({ error: err.message }, { status: 503 });
+    }
     if (err instanceof MarketFeedError) {
       // Both the fresh fetch and the stale fallback came up empty — this
       // only happens on a truly cold start with the upstream feed also
