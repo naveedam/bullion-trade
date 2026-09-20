@@ -1,84 +1,141 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { RateLockTimer } from "./RateLockTimer";
 import { VolumeSelector } from "./VolumeSelector";
 import { BreakdownDrawer } from "./BreakdownDrawer";
 import { VanPaymentPanel } from "./VanPaymentPanel";
 
-// Illustrative constants — in production these come from the live feed
-// (LBMA/COMEX spot, interbank USD/INR) via the WebSocket gateway, and from
-// the entity's negotiated refiner premium / platform markup tier.
-const CUSTOMS_DUTY_FACTOR = 0.06;
-const REFINER_PREMIUM_PER_GRAM = 45;
-const PLATFORM_MARKUP_BPS = 25;
-const GRAMS_PER_TROY_OUNCE = 31.1035;
-
-interface Tick {
-  baseSpotUsdPerOz: number;
-  usdInrRate: number;
-  askPricePerGram: number;
+interface TickSnapshot {
+  metal: "GOLD" | "SILVER";
   quoteId: string;
-  asOf: Date;
+  baseSpotPerGramInr: string;
+  customsAdjustedPerGramInr: string;
+  refinerPremiumInr: string;
+  platformMarkupInr: string;
+  askPricePerGramInr: string;
+  baseSpotUsdPerOz: string;
+  usdInrRate: string;
+  generatedAt: string;
+  stale: boolean;
 }
 
-function generateTick(previous?: Tick): Tick {
-  const baseSpotUsdPerOz =
-    (previous?.baseSpotUsdPerOz ?? 2650) + (Math.random() - 0.5) * 1.2;
-  const usdInrRate = (previous?.usdInrRate ?? 83.4) + (Math.random() - 0.5) * 0.01;
+interface RateLockState {
+  ratePerGram: number;
+  expiresAt: Date;
+  quoteId: string;
+}
 
-  const baseSpotPerGramUsd = baseSpotUsdPerOz / GRAMS_PER_TROY_OUNCE;
-  const customsAdjustedPerGramInr =
-    baseSpotPerGramUsd * (1 + CUSTOMS_DUTY_FACTOR) * usdInrRate;
-  const platformMarkupInr =
-    (customsAdjustedPerGramInr * PLATFORM_MARKUP_BPS) / 10000;
-  const askPricePerGram =
-    customsAdjustedPerGramInr + REFINER_PREMIUM_PER_GRAM + platformMarkupInr;
-
-  return {
-    baseSpotUsdPerOz,
-    usdInrRate,
-    askPricePerGram,
-    quoteId: `Q-${Date.now()}`,
-    asOf: new Date(),
-  };
+/**
+ * There's no real auth in this scaffold yet, so trades are attributed to a
+ * per-browser id persisted in localStorage — good enough to exercise the
+ * rate-lock flow end to end, but this needs to become an actual logged-in
+ * user/entity id (see the Entity/User models in prisma/schema.prisma)
+ * before this goes anywhere near a real order.
+ */
+function getDemoUserId(): string {
+  if (typeof window === "undefined") return "server";
+  const key = "bullion-demo-user-id";
+  let id = window.localStorage.getItem(key);
+  if (!id) {
+    id = crypto.randomUUID();
+    window.localStorage.setItem(key, id);
+  }
+  return id;
 }
 
 export function TradingTerminal() {
   const [metal, setMetal] = useState<"GOLD" | "SILVER">("GOLD");
   const [volumeGrams, setVolumeGrams] = useState(1000);
-  const [tick, setTick] = useState<Tick>(() => generateTick());
-  const [lock, setLock] = useState<{
-    ratePerGram: number;
-    expiresAt: Date;
-  } | null>(null);
+  const [tick, setTick] = useState<TickSnapshot | null>(null);
+  const [tickError, setTickError] = useState<string | null>(null);
+  const [lock, setLock] = useState<RateLockState | null>(null);
+  const [lockError, setLockError] = useState<string | null>(null);
+  const [lockPending, setLockPending] = useState(false);
+  const lockRef = useRef<RateLockState | null>(null);
+  lockRef.current = lock;
 
-  // Simulate the live tick board — replace with the WebSocket gateway feed.
+  // Poll the live tick endpoint. Freezes while a rate is locked, since the
+  // quote shouldn't visibly move once the price is fixed for this order.
   useEffect(() => {
-    if (lock) return; // freeze ticking while a rate is locked
-    const interval = setInterval(() => setTick((t) => generateTick(t)), 1500);
-    return () => clearInterval(interval);
-  }, [lock]);
+    let cancelled = false;
 
-  function handleLock() {
-    setLock({
-      ratePerGram: tick.askPricePerGram,
-      expiresAt: new Date(Date.now() + 30_000),
-    });
+    async function poll() {
+      if (lockRef.current) return;
+      try {
+        const res = await fetch(`/api/tick?metal=${metal}`);
+        if (!res.ok) {
+          const body = await res.json().catch(() => ({}));
+          throw new Error(body.error ?? `HTTP ${res.status}`);
+        }
+        const data = (await res.json()) as TickSnapshot;
+        if (!cancelled) {
+          setTick(data);
+          setTickError(null);
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setTickError(err instanceof Error ? err.message : "Failed to fetch live price");
+        }
+      }
+    }
+
+    poll();
+    const interval = setInterval(poll, 1500);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [metal, lock]);
+
+  // Reset the tick when the metal changes so stale-metal prices never flash.
+  useEffect(() => {
+    setTick(null);
+    setLock(null);
+  }, [metal]);
+
+  async function handleLock() {
+    if (!tick) return;
+    setLockPending(true);
+    setLockError(null);
+    try {
+      const res = await fetch("/api/rate-lock", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          userId: getDemoUserId(),
+          metal,
+          volumeGrams: String(volumeGrams),
+          quoteId: tick.quoteId,
+        }),
+      });
+      const body = await res.json();
+      if (!res.ok) {
+        throw new Error(body.error ?? `HTTP ${res.status}`);
+      }
+      setLock({
+        ratePerGram: Number(body.ratePerGram),
+        expiresAt: new Date(body.expiresAt),
+        quoteId: body.quoteId,
+      });
+    } catch (err) {
+      setLockError(
+        err instanceof Error ? err.message : "Failed to lock rate — try again"
+      );
+    } finally {
+      setLockPending(false);
+    }
   }
 
   function handleExpire() {
     setLock(null);
-    setTick((t) => generateTick(t));
   }
 
-  const displayRate = lock ? lock.ratePerGram : tick.askPricePerGram;
-  const customsAdjustedPerGramInr =
-    (tick.baseSpotUsdPerOz / GRAMS_PER_TROY_OUNCE) *
-    (1 + CUSTOMS_DUTY_FACTOR) *
-    tick.usdInrRate;
-  const platformMarkupInr =
-    (customsAdjustedPerGramInr * PLATFORM_MARKUP_BPS) / 10000;
+  const displayTick = tick;
+  const displayRate = lock ? lock.ratePerGram : Number(displayTick?.askPricePerGramInr ?? 0);
+  const customsAdjustedPerGramInr = Number(displayTick?.customsAdjustedPerGramInr ?? 0);
+  const refinerPremiumPerGram = Number(displayTick?.refinerPremiumInr ?? 0);
+  const platformMarkupInr = Number(displayTick?.platformMarkupInr ?? 0);
 
   const grossAmount = displayRate * volumeGrams;
   const gstAmount = grossAmount * 0.03;
@@ -96,11 +153,19 @@ export function TradingTerminal() {
           </p>
         </div>
         <div className="text-right">
-          <p className="text-xs text-parchment-dim">Live spot</p>
-          <p className="font-numeric text-sm text-bullion-silver">
-            ${tick.baseSpotUsdPerOz.toFixed(2)} / oz · ₹
-            {tick.usdInrRate.toFixed(3)}
+          <p className="text-xs text-parchment-dim">
+            Live spot{displayTick?.stale ? " (last known)" : ""}
           </p>
+          {displayTick ? (
+            <p className="font-numeric text-sm text-bullion-silver">
+              ${Number(displayTick.baseSpotUsdPerOz).toFixed(2)} / oz · ₹
+              {Number(displayTick.usdInrRate).toFixed(3)}
+            </p>
+          ) : (
+            <p className="font-numeric text-sm text-parchment-dim">
+              {tickError ?? "Loading…"}
+            </p>
+          )}
         </div>
       </header>
 
@@ -108,10 +173,7 @@ export function TradingTerminal() {
         <section className="space-y-5 lg:col-span-1">
           <VolumeSelector
             metal={metal}
-            onMetalChange={(m) => {
-              setMetal(m);
-              setLock(null);
-            }}
+            onMetalChange={(m) => setMetal(m)}
             onVolumeChange={(grams) => {
               setVolumeGrams(grams);
               setLock(null);
@@ -125,9 +187,12 @@ export function TradingTerminal() {
           {!lock ? (
             <button
               onClick={handleLock}
-              className="w-full py-3 bg-bullion-gold text-graphite-950 text-sm font-medium hover:bg-bullion-gold/90 transition-colors"
+              disabled={!tick || lockPending}
+              className="w-full py-3 bg-bullion-gold text-graphite-950 text-sm font-medium hover:bg-bullion-gold/90 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
             >
-              Lock rate for {volumeGrams.toLocaleString("en-IN")} g
+              {lockPending
+                ? "Locking…"
+                : `Lock rate for ${volumeGrams.toLocaleString("en-IN")} g`}
             </button>
           ) : (
             <button
@@ -137,12 +202,13 @@ export function TradingTerminal() {
               Rate locked — confirm payment below
             </button>
           )}
+          {lockError && <p className="text-xs text-alert">{lockError}</p>}
         </section>
 
         <section className="lg:col-span-1">
           <BreakdownDrawer
             baseRatePerGram={customsAdjustedPerGramInr}
-            refinerPremium={REFINER_PREMIUM_PER_GRAM}
+            refinerPremium={refinerPremiumPerGram}
             platformMarkup={platformMarkupInr}
             volumeGrams={volumeGrams}
             gstAmount={gstAmount}

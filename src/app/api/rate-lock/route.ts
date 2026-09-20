@@ -1,20 +1,26 @@
 import { NextRequest, NextResponse } from "next/server";
 import Decimal from "decimal.js";
-import Redis from "ioredis";
 import { RateLockManager, RateLockError } from "../../../lib/rateLock";
-// import { getLatestTick } from "../../../lib/tickCache";
+import { getRateForQuote } from "../../../lib/tickService";
+import { getRedis } from "../../../lib/redis";
 // import { prisma } from "../../../lib/db";
 
-const redis = new Redis(process.env.REDIS_URL ?? "redis://localhost:6379");
+const redis = getRedis();
 
 const lockManager = new RateLockManager({
   redis,
-  getQuotedRatePerGram: async (_quoteId, _metal) => {
-    // Replace with a real lookup against the live tick cache (e.g. Redis
-    // hash updated by the WebSocket ingestion service) keyed by quoteId.
-    // Throwing here deliberately until wired, so a misconfigured deploy
-    // fails loudly instead of quoting a stale placeholder price.
-    throw new Error("getQuotedRatePerGram not wired to the live tick cache");
+  getQuotedRatePerGram: async (quoteId, _metal) => {
+    const rate = await getRateForQuote(redis, quoteId);
+    if (!rate) {
+      // Most common cause: the quote this lock request names has aged out
+      // of the tick cache (>35s old) — the client's poll loop should have
+      // a fresher quoteId within a couple of seconds either way.
+      throw new RateLockError(
+        `No live quote for quoteId=${quoteId} — it has expired, refresh and try again`,
+        "QUOTE_EXPIRED"
+      );
+    }
+    return rate;
   },
   persistAudit: async (record) => {
     // await prisma.rateLockAudit.create({ data: { ... } });

@@ -5,19 +5,11 @@
  * one wiring path instead of five slightly-different ad hoc constructions.
  */
 
-import Redis from "ioredis";
 import { KotakNeoAuthClient } from "./neoAuth";
 import { InstrumentResolver } from "./instrumentResolver";
 import { KotakNeoHedgeAdapter } from "./kotakNeoAdapter";
 import type { McxMarketHoursConfig } from "./marketHours";
-
-let redisSingleton: Redis | null = null;
-function getRedis(): Redis {
-  if (!redisSingleton) {
-    redisSingleton = new Redis(process.env.REDIS_URL ?? "redis://localhost:6379");
-  }
-  return redisSingleton;
-}
+import { getRedis } from "../redis";
 
 /**
  * Holiday check backed by a Redis SET of ISO date strings (YYYY-MM-DD),

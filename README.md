@@ -15,6 +15,20 @@ src/lib/pricing.ts             Dynamic spot → ask-price calculator.
                                 Decimal-safe (decimal.js), GST (3%) and
                                 Section 206C(1H) TCS handling.
 
+src/lib/marketFeed.ts          Live spot (gold-api.com, free/no-key) and
+                                USD/INR (open.er-api.com, free/no-key,
+                                daily) with a Redis pull-through cache and
+                                stale-fallback so a provider hiccup degrades
+                                gracefully instead of 500ing the quote board.
+
+src/lib/tickService.ts         Bridges marketFeed.ts to pricing.ts, caches
+                                the resulting tick under both a
+                                "current per metal" key (for /api/tick's
+                                polling) and a "per quoteId" key kept
+                                slightly longer than the lock window (for
+                                the rate-lock endpoint to resolve exactly
+                                what was quoted).
+
 src/lib/rateLock.ts            Redis-backed 30-second distributed lock.
                                 acquireLock() / commitLock() with atomic
                                 compare-and-delete to prevent race conditions
@@ -122,6 +136,32 @@ src/components/, src/app/trading/
   is written to fail loudly (typed errors, no silent fallthrough) precisely
   so a wrong assumption here surfaces in staging, not as a phantom
   unhedged position in production.
+
+## What's actually live now vs. still simulated
+
+The tick board and rate lock are real as of this update — `/api/tick` and
+`/api/rate-lock` hit live public feeds and a real Redis lock, not local
+component state. Specifically:
+
+- **Live**: `/api/tick` (spot price from gold-api.com, USD/INR from
+  open.er-api.com, both free/no-key), `/api/rate-lock` (Redis-backed
+  30-second lock, resolved against the exact quoteId that was ticked).
+- **Still simulated / hardcoded**: the VAN/IFSC/bank shown in
+  `VanPaymentPanel` (no `VirtualAccount` row exists yet — Postgres isn't
+  wired), the demo user id (a random UUID in `localStorage`, not real
+  auth), and everything past "lock rate" — no `Order` row is actually
+  created, so there's nothing yet for a bank webhook to reconcile against.
+- **A real limitation, not a bug**: open.er-api.com's USD/INR rate only
+  refreshes once a day. The gold spot leg is genuinely live; the FX leg is
+  "today's rate", not "this second's rate". Fine for a working demo — swap
+  for a paid intraday FX feed (or your settlement bank's own quoted rate)
+  before this handles a real settlement amount.
+- **Requires `REDIS_URL` to actually work.** Rate-lock and the tick cache
+  both depend on Redis — without it, `/api/tick` and `/api/rate-lock` will
+  fail. Point `REDIS_URL` (in `.env` locally, or your Vercel project's
+  environment variables for the deployed site) at any real Redis instance —
+  Upstash's free tier works fine and gives you a standard `redis://` or
+  `rediss://` connection string.
 
 ## Wiring to Prisma
 
