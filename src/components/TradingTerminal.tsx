@@ -9,7 +9,7 @@ import { VanPaymentPanel } from "./VanPaymentPanel";
 interface TickSnapshot {
   metal: "GOLD" | "SILVER";
   quoteId: string;
-  priceSource: "MCX" | "LBMA_FX";
+  priceSource: "IBJA_ANCHORED" | "LBMA_FX";
   baseSpotPerGramInr: string;
   customsAdjustedPerGramInr: string;
   refinerPremiumInr: string;
@@ -17,8 +17,9 @@ interface TickSnapshot {
   askPricePerGramInr: string;
   baseSpotUsdPerOz: string;
   usdInrRate: string;
-  mcxTradingSymbol?: string;
-  mcxLtp?: string;
+  ibjaRatePerGramInr?: string;
+  ibjaPublishedAt?: string;
+  driftRatio?: string;
   generatedAt: string;
   stale: boolean;
 }
@@ -157,15 +158,18 @@ export function TradingTerminal() {
         </div>
         <div className="text-right">
           <p className="text-xs text-parchment-dim">
-            {displayTick?.priceSource === "MCX"
-              ? `MCX ${displayTick.mcxTradingSymbol ?? ""}`
+            {displayTick?.priceSource === "IBJA_ANCHORED"
+              ? `IBJA anchored${displayTick.ibjaPublishedAt ? ` · ${displayTick.ibjaPublishedAt}` : ""}`
               : "Live spot"}
             {displayTick?.stale ? " (last known)" : ""}
           </p>
           {displayTick ? (
-            displayTick.priceSource === "MCX" ? (
+            displayTick.priceSource === "IBJA_ANCHORED" ? (
               <p className="font-numeric text-sm text-bullion-silver">
-                ₹{Number(displayTick.mcxLtp).toLocaleString("en-IN")} / 10g
+                ₹{Number(displayTick.ibjaRatePerGramInr).toLocaleString("en-IN")}/g base
+                {displayTick.driftRatio && (
+                  <> · {(Number(displayTick.driftRatio) * 100 - 100).toFixed(2)}% drift</>
+                )}
               </p>
             ) : (
               <p className="font-numeric text-sm text-bullion-silver">

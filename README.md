@@ -1,8 +1,11 @@
 # Bullion Trading Platform — Core Scaffold
 
-A B2B wholesale bullion (gold/silver) trading platform for the Indian market:
-pre-funded virtual-account clearing, a 30-second rate-lock engine, and
-automated delta-hedging against MCX gold futures.
+A B2B bullion (gold/silver) price-lock platform for Bangalore's wholesale
+jewellery trade — replacing phone/WhatsApp price-locking between suppliers
+and Raja Market/Chickpet retailers with a transparent, instantly-lockable
+rate. No brokerage or order-execution role: the platform quotes and locks
+prices, then a bank transfer settles the trade (pre-funded virtual-account
+clearing, a 30-second rate-lock engine).
 
 ## What's here
 
@@ -15,18 +18,34 @@ src/lib/pricing.ts             Dynamic spot → ask-price calculator.
                                 Decimal-safe (decimal.js), GST (3%) and
                                 Section 206C(1H) TCS handling.
 
-src/lib/marketFeed.ts          Live spot (gold-api.com, free/no-key) and
-                                USD/INR (open.er-api.com, free/no-key,
-                                daily) with a Redis pull-through cache and
-                                stale-fallback so a provider hiccup degrades
-                                gracefully instead of 500ing the quote board.
+src/lib/marketFeed.ts          Live international spot (gold-api.com,
+                                free/no-key) and USD/INR (open.er-api.com,
+                                free/no-key, daily) with a Redis
+                                pull-through cache and stale-fallback so a
+                                provider hiccup degrades gracefully instead
+                                of 500ing the quote board. Feeds the drift
+                                calculation in tickService.ts and the
+                                LBMA+FX fallback mode.
 
-src/lib/tickService.ts         Bridges marketFeed.ts to pricing.ts, caches
-                                the resulting tick under both a
-                                "current per metal" key (for /api/tick's
-                                polling) and a "per quoteId" key kept
-                                slightly longer than the lock window (for
-                                the rate-lock endpoint to resolve exactly
+src/lib/ibja.ts                The pricing anchor — India Bullion and
+                                Jewellers Association's published gold/
+                                silver rate, the benchmark the Indian
+                                bullion trade actually references. NOT
+                                wired to a real provider yet — see the file
+                                header and the "What's live" section below.
+
+src/lib/tickService.ts         The actual pricing engine: takes the IBJA
+                                anchor and drifts it live using how much
+                                marketFeed.ts's international price has
+                                moved since the anchor was captured, so the
+                                display keeps moving between IBJA's
+                                periodic republishes. Falls back to a plain
+                                LBMA+FX reconstruction if IBJA fails
+                                outright. Caches the resulting tick under
+                                both a "current per metal" key (for
+                                /api/tick's polling) and a "per quoteId"
+                                key kept slightly longer than the lock
+                                window (for rate-lock to resolve exactly
                                 what was quoted).
 
 src/lib/rateLock.ts            Redis-backed 30-second distributed lock.
@@ -38,15 +57,25 @@ src/lib/webhook.ts             Bank settlement webhook ingestion: HMAC
                                 verification, replay protection, VAN +
                                 amount reconciliation, order state advance.
 
-src/lib/hedging.ts             Delta-hedging trigger. Broker-agnostic
+src/lib/hedging.ts              NOT currently used by any active code
+                                path — the platform doesn't place orders
+                                or hedge exposure (see business decision
+                                above). Kept in the repo, self-contained,
+                                in case that changes. Broker-agnostic
                                 interface (HedgeBroker) + a Kite Connect
-                                adapter (secondary/fallback). Greedy
-                                lot-decomposition across Gold Petal / Gold
-                                Mini / Gold 1kg. Also holds the fill-poller
-                                (pollAndReconcileHedgeFills) that reconciles
-                                broker fills back onto HedgingPosition rows.
+                                adapter. Greedy lot-decomposition across
+                                Gold Petal / Gold Mini / Gold 1kg. Also
+                                holds the fill-poller
+                                (pollAndReconcileHedgeFills).
 
-src/lib/kotak/                 Kotak Neo — the primary hedging broker.
+src/lib/kotak/                  Kotak Neo integration — also NOT wired
+                                 into any active code path currently (see
+                                 above). Left intact and working (verified
+                                 against OptionPal Pro's real
+                                 implementation — see git history / prior
+                                 discussion for what's confirmed vs.
+                                 inferred) in case hedging becomes
+                                 relevant later.
   neoAuth.ts                     2-step login (password + TOTP via
                                   otplib), Redis-cached bearer/sid session,
                                   login-storm protection, health-check ping.
@@ -141,51 +170,35 @@ src/components/, src/app/trading/
 
 - **Live**: `/api/tick`, `/api/rate-lock` (real Redis lock, resolved against
   the exact quoteId that was ticked).
-- **Pricing source, per the platform's decision**: GOLD prices off the
-  **MCX GOLD (1kg) futures LTP** via Kotak Neo — chosen over Gold Mini for
-  deeper institutional open interest — converted to price-per-gram using
-  MCX's actual quotation unit (₹ per **10 grams**, not per lot size; see
-  `kotak/types.ts` for the citation). If the Kotak session or quote fetch
-  fails for any reason, gold silently falls back to the LBMA-equivalent
-  spot + FX reconstruction rather than erroring — `TickSnapshot.priceSource`
-  always records which one actually priced a given tick, so this is
-  auditable rather than blended. SILVER still only uses LBMA+FX; it wasn't
-  part of this decision.
-- **The Kotak Neo integration (`src/lib/kotak/`) was rewritten against
-  real, verified code** from OptionPal Pro (`neoAuth.ts`, `quotes.ts`,
-  `instrumentResolver.ts`, `kotakNeoAdapter.ts` all corrected) rather than
-  left as guesses. Real login flow is UCC + TOTP, then MPIN — there is no
-  password step and no consumer secret. Auth lives on a different host
-  (`mis.kotaksecurities.com`) than trading/market-data calls, whose actual
-  base URL is returned per-session by login, not a fixed constant. Order
-  payloads use short broker-internal field codes (`am/dq/es/pc/pt/qt/tt/…`),
-  not readable names. All of this was smoke-tested end-to-end against
-  mocked responses shaped like the real API (see the file headers in
-  `src/lib/kotak/` for what's independently verified vs. inferred by
-  family/pattern from the one thing that IS verified).
-- **TOTP can't be automated** — verified against OptionPal Pro's own
-  working code, which has a human type in a fresh 6-digit code every
-  session; there's no evidence of a registerable static secret for
-  unattended login. `POST /api/admin/kotak-login` (protected by
-  `ADMIN_SECRET`) is the entry point for supplying it — call it with
-  today's code to establish or refresh the session. This is a genuine open
-  operational question for unattended hedge execution, not a solved
-  problem: either confirm Kotak Neo's API-trading setup supports a static
-  TOTP secret, or accept a human needs to periodically re-auth (the
-  existing hedge-failure alerting at least surfaces it promptly when a
-  session lapses mid-hedge).
-- **The MCX scrip-master column names are unconfirmed for `mcx_fo`
-  specifically.** OptionPal Pro's own working parser fuzzy-matches header
-  names because Kotak's real CSV columns aren't documented anywhere they
-  found — that same fuzzy-matching approach is used here, but only ever
-  exercised against `nse_fo` in the source it came from. If contract
-  resolution fails, the error includes the actual header row seen so this
-  is fast to diagnose against a real file.
-- **The one piece that's still an educated guess, not verified**:
-  `pollFill` in `kotakNeoAdapter.ts` — OptionPal Pro's working code never
-  implements fill polling (it records the order id and stops). That
-  endpoint is inferred from the same `Orders/2.0` family as the verified
-  order-placement call, flagged inline.
+- **Pricing model, per the platform's business decision** (a B2B price-lock
+  platform for Bangalore's bullion trade — not a brokerage, no order
+  execution): both GOLD and SILVER price off an **IBJA anchor with live
+  drift**. The anchor is India Bullion and Jewellers Association's
+  published rate — the benchmark the formal Indian bullion trade actually
+  references — refreshed every few hours. Between refreshes, the anchor is
+  scaled by how much the international spot+FX price has moved since it
+  was captured, so the displayed price keeps moving in real time without
+  ever floating disconnected from the trade's actual reference rate. See
+  `tickService.ts`'s file header for the exact math. If IBJA fails
+  outright, gold and silver both fall back to the plain LBMA+FX
+  reconstruction — `TickSnapshot.priceSource` always records which mode
+  priced a given tick.
+- **`src/lib/ibja.ts` is the one unwired piece** — there's no single
+  obvious free IBJA source the way gold-api.com/open.er-api.com were for
+  international spot. `fetchIbjaFromProvider` throws with a clear message
+  until you pick a provider (a licensed API like indiagoldratesapi.com, or
+  a RapidAPI-hosted listing) and implement its real request/response
+  shape — the file header has the contract and an example. Everything
+  downstream (the anchor caching, drift math, fallback) is built and
+  smoke-tested against simulated IBJA data already; wiring a real provider
+  in is the only remaining step for this to be genuinely live end to end.
+- **Kotak Neo / MCX (`src/lib/kotak/`) is no longer in the pricing path.**
+  Left in the repo untouched, in case hedging becomes relevant later, but
+  `tickService.ts` doesn't call it — the business doesn't place orders or
+  need a broker account, so it made no sense to keep MCX-via-Kotak as the
+  primary price source. If this ever changes, `mcxPricingService.ts` is
+  still there and was working (see its own commit history / prior
+  conversation) — it would just need re-wiring into `tickService.ts`.
 - **Still simulated / hardcoded**: the VAN/IFSC/bank shown in
   `VanPaymentPanel` (no `VirtualAccount` row exists yet — Postgres isn't
   wired), the demo user id (a random UUID in `localStorage`, not real
@@ -193,12 +206,11 @@ src/components/, src/app/trading/
   created, so there's nothing yet for a bank webhook to reconcile against.
 - **Requires `REDIS_URL` to actually work.** Rate-lock and the tick cache
   both depend on Redis — without it, `/api/tick` and `/api/rate-lock` will
-  fail. Point `REDIS_URL` (in `.env` locally, or your Vercel project's
-  environment variables for the deployed site) at any real Redis instance —
-  Upstash's free tier works fine.
-- **Requires the `KOTAK_*` env vars for MCX pricing to activate** — until
-  `quotes.ts` is wired and those are set, gold prices off LBMA+FX and that's
-  fine; nothing breaks, it just isn't pricing off MCX yet.
+  fail with a clear `RedisNotConfiguredError` message (503) rather than a
+  generic 500. If using Upstash: copy the `rediss://` (TLS) connection
+  string specifically, not the `https://` REST API URL and not the
+  `redis-cli --tls -u ...` command Upstash shows by default — only the
+  `rediss://...` portion is the actual value `REDIS_URL` needs.
 
 ## Wiring to Prisma
 
