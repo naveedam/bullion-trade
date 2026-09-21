@@ -170,6 +170,51 @@ src/components/, src/app/trading/
 
 - **Live**: `/api/tick`, `/api/rate-lock` (real Redis lock, resolved against
   the exact quoteId that was ticked).
+- **Auth: phone + OTP, real session, real security fix.** `/api/auth/
+  request-otp` and `/api/auth/verify-otp` implement the full flow — OTP
+  hashed and stored in Redis (never plaintext), 60s resend cooldown,
+  5-attempt cap, session issued as a signed JWT in an httpOnly cookie. All
+  of this was smoke-tested directly (happy path, replay rejection,
+  cooldown enforcement, attempt limiting, tampered-token rejection — see
+  git history / prior conversation for the test output). First-time login
+  auto-creates a minimal `Entity` (KYC `PENDING`) + `User`.
+  **Real security fix included**: `/api/rate-lock` previously trusted
+  whatever `userId` the client sent in the request body — anyone could
+  impersonate anyone. It now derives the user from the verified session
+  only.
+- **Order confirmation is real.** `/api/orders/confirm` commits the Redis
+  lock (atomically, so it can't be double-spent), checks the entity's KYC
+  is `VERIFIED`, and creates a genuine `Order` + `VirtualAccount` +
+  `LogisticsRecord` in Postgres via a single Prisma transaction. The VAN
+  issued is a **platform-generated placeholder**, not a real bank-issued
+  virtual account — there's no partner bank integration (ICICI/HDFC/Axis
+  e-Collection) behind it yet. That's flagged in the code, not silently
+  faked.
+- **No KYC review workflow exists yet.** Every new signup starts
+  `PENDING` and there's no admin UI to approve them — `POST
+  /api/admin/verify-entity` (protected by `ADMIN_SECRET`) is the minimal
+  manual lever to unblock testing the confirm-order flow, not a real
+  admin panel. Building actual KYC review (document upload, approval
+  queue) is separate, real work.
+- **SMS delivery is not wired to a real vendor.** `src/lib/auth/sms.ts`
+  logs the OTP to the server console and echoes it in the API response in
+  development — that's how the smoke test above worked without a real
+  SMS account. In production it throws with a clear message rather than
+  guess at MSG91/Twilio/TextLocal's exact API shape unverified, same
+  policy as everywhere else in this build that's touched an unverified
+  third-party endpoint.
+- **A note on verification limits for this update specifically**: my
+  sandbox's network allowlist blocks `binaries.prisma.sh`, so I could not
+  run `prisma generate` or `prisma validate` here — meaning the
+  auth/order-confirm code was typechecked against Prisma's pre-generation
+  placeholder client (which types everything `any`), not the real
+  schema-specific generated types. I did a careful manual line-by-line
+  review of every Prisma call against the schema instead, and caught one
+  real bug this way (a `string | undefined` passed where Prisma requires
+  a definite `string` in `admin/verify-entity`, now fixed with an explicit
+  guard). Run `npm install && npx prisma generate` yourself before
+  deploying to get a real compiler check — my sandbox's restriction won't
+  apply to yours.
 - **Pricing model, per the platform's business decision** (a B2B price-lock
   platform for Bangalore's bullion trade — not a brokerage, no order
   execution): both GOLD and SILVER price off an **IBJA anchor with live
@@ -199,18 +244,21 @@ src/components/, src/app/trading/
   primary price source. If this ever changes, `mcxPricingService.ts` is
   still there and was working (see its own commit history / prior
   conversation) — it would just need re-wiring into `tickService.ts`.
-- **Still simulated / hardcoded**: the VAN/IFSC/bank shown in
-  `VanPaymentPanel` (no `VirtualAccount` row exists yet — Postgres isn't
-  wired), the demo user id (a random UUID in `localStorage`, not real
-  auth), and everything past "lock rate" — no `Order` row is actually
-  created, so there's nothing yet for a bank webhook to reconcile against.
-- **Requires `REDIS_URL` to actually work.** Rate-lock and the tick cache
-  both depend on Redis — without it, `/api/tick` and `/api/rate-lock` will
-  fail with a clear `RedisNotConfiguredError` message (503) rather than a
+- **Still simulated / hardcoded**: nothing left in the core quote-to-order
+  flow at this point — the remaining gaps are the ones named above
+  (KYC review, real bank VAN issuance, real SMS vendor, real IBJA
+  provider), each flagged in its own file rather than silently faked.
+- **Requires `REDIS_URL` to actually work.** Rate-lock, the tick cache, and
+  OTP storage all depend on Redis — without it, the relevant routes fail
+  with a clear `RedisNotConfiguredError` message (503) rather than a
   generic 500. If using Upstash: copy the `rediss://` (TLS) connection
   string specifically, not the `https://` REST API URL and not the
   `redis-cli --tls -u ...` command Upstash shows by default — only the
   `rediss://...` portion is the actual value `REDIS_URL` needs.
+- **Requires `DATABASE_URL` and `AUTH_JWT_SECRET`** for auth and order
+  confirmation to work — see `.env.example`. Run
+  `npx prisma migrate dev` (or `prisma db push` for a quick first pass)
+  against your Postgres instance before testing login.
 
 ## Wiring to Prisma
 

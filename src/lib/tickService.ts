@@ -255,3 +255,10 @@ export async function getRateForQuote(redis: Redis, quoteId: string): Promise<De
   const snapshot = JSON.parse(raw) as TickSnapshot;
   return new Decimal(snapshot.askPricePerGramInr);
 }
+
+/** Full snapshot for a specific quoteId — used by order confirmation to persist a full audit trail. */
+export async function getTickById(redis: Redis, quoteId: string): Promise<TickSnapshot | null> {
+  const raw = await redis.get(`tick:byid:${quoteId}`);
+  if (!raw) return null;
+  return JSON.parse(raw) as TickSnapshot;
+}

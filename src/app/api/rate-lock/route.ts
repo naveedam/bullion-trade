@@ -1,63 +1,40 @@
 import { NextRequest, NextResponse } from "next/server";
 import Decimal from "decimal.js";
-import { RateLockManager, RateLockError } from "../../../lib/rateLock";
-import { getRateForQuote } from "../../../lib/tickService";
-import { getRedis, RedisNotConfiguredError } from "../../../lib/redis";
-// import { prisma } from "../../../lib/db";
-
-// Built lazily inside the handler, not at module load time — getRedis()
-// now throws when REDIS_URL is unset, and a throw at module scope crashes
-// the whole route on cold start with an opaque error rather than a clean
-// HTTP response. Constructing it inside POST() means the try/catch below
-// actually gets a chance to handle it.
-let lockManager: RateLockManager | null = null;
-function getLockManager(): RateLockManager {
-  if (!lockManager) {
-    const redis = getRedis();
-    lockManager = new RateLockManager({
-      redis,
-      getQuotedRatePerGram: async (quoteId, _metal) => {
-        const rate = await getRateForQuote(redis, quoteId);
-        if (!rate) {
-          // Most common cause: the quote this lock request names has aged
-          // out of the tick cache (>35s old) — the client's poll loop
-          // should have a fresher quoteId within a couple of seconds
-          // either way.
-          throw new RateLockError(
-            `No live quote for quoteId=${quoteId} — it has expired, refresh and try again`,
-            "QUOTE_EXPIRED"
-          );
-        }
-        return rate;
-      },
-      persistAudit: async (record) => {
-        // await prisma.rateLockAudit.create({ data: { ... } });
-        void record;
-      },
-    });
-  }
-  return lockManager;
-}
+import { RateLockError } from "../../../lib/rateLock";
+import { getLockManager } from "../../../lib/rateLockService";
+import { RedisNotConfiguredError } from "../../../lib/redis";
+import { getSession } from "../../../lib/auth/session";
 
 export async function POST(req: NextRequest) {
+  // userId is NEVER trusted from the request body — it comes from the
+  // verified session only. Previously this route trusted whatever userId
+  // the client claimed to be, which meant anyone could lock rates (and, if
+  // order confirmation had been wired to it, place orders) as anyone else.
+  const session = await getSession(req);
+  if (!session) {
+    return NextResponse.json(
+      { error: "Not logged in — request and verify an OTP first" },
+      { status: 401 }
+    );
+  }
+
   const body = await req.json();
-  const { userId, metal, volumeGrams, quoteId } = body as {
-    userId: string;
+  const { metal, volumeGrams, quoteId } = body as {
     metal: "GOLD" | "SILVER";
     volumeGrams: string;
     quoteId: string;
   };
 
-  if (!userId || !metal || !volumeGrams || !quoteId) {
+  if (!metal || !volumeGrams || !quoteId) {
     return NextResponse.json(
-      { error: "userId, metal, volumeGrams, quoteId are all required" },
+      { error: "metal, volumeGrams, quoteId are all required" },
       { status: 400 }
     );
   }
 
   try {
     const result = await getLockManager().acquireLock({
-      userId,
+      userId: session.userId,
       metal,
       volumeGrams: new Decimal(volumeGrams),
       quoteId,
