@@ -21,6 +21,10 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({
       sent: true,
       cooldownSeconds: result.cooldownSeconds,
+      // Only populated when sms.ts's dev-echo path is active (local dev,
+      // or ALLOW_SMS_DEV_ECHO=true on a real deployment for testing before
+      // a real vendor is wired) — undefined otherwise, so this field is
+      // simply absent from the response once a real vendor is in place.
       devEchoCode: result.devEchoCode,
     });
   } catch (err) {

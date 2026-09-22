@@ -12,13 +12,20 @@
  * for an India-focused B2B app: MSG91, Twilio, TextLocal. Pick one, get an
  * API key, and implement sendOtpSms() below against their real docs.
  *
- * In development (NODE_ENV !== "production"), sendOtpSms() doesn't call
- * any vendor at all - it logs the code to the server console and the
- * request-otp API route echoes it back in the JSON response (clearly
- * marked, and ONLY when NODE_ENV !== "production" - see
- * src/app/api/auth/request-otp/route.ts) so the whole login flow is
- * testable locally without a real SMS account. That dev echo must never
- * ship to production; the route enforces this itself, not just this file.
+ * Two ways the dev-echo (log instead of send) path activates:
+ *   1. NODE_ENV !== "production" - normal local development.
+ *   2. ALLOW_SMS_DEV_ECHO=true - an explicit, deliberate override for
+ *      testing a real deployment (e.g. Vercel, where NODE_ENV is always
+ *      "production") before a real SMS vendor is wired. This is NOT tied
+ *      to environment detection on purpose - it only activates if you set
+ *      it yourself, so it can never accidentally leak into a real
+ *      customer-facing deployment. Unset it (or set it to anything other
+ *      than "true") once a real vendor is wired below, since leaving it on
+ *      means anyone's OTP is visible in the API response.
+ *
+ * Either way, the request-otp API route only echoes the code back in the
+ * JSON response when one of these two conditions holds - see
+ * src/app/api/auth/request-otp/route.ts.
  */
 
 export class SmsProviderError extends Error {
@@ -30,12 +37,16 @@ export class SmsProviderError extends Error {
 
 export interface SendSmsResult {
   delivered: boolean;
-  /** Only ever populated outside production - see file header. */
+  /** Only populated when the dev-echo path is active - see file header. */
   devEchoCode?: string;
 }
 
+function devEchoActive(): boolean {
+  return process.env.NODE_ENV !== "production" || process.env.ALLOW_SMS_DEV_ECHO === "true";
+}
+
 export async function sendOtpSms(phone: string, code: string): Promise<SendSmsResult> {
-  if (process.env.NODE_ENV !== "production") {
+  if (devEchoActive()) {
     // eslint-disable-next-line no-console
     console.log(`[sms:dev] OTP for ${phone}: ${code}`);
     return { delivered: true, devEchoCode: code };
@@ -60,7 +71,7 @@ export async function sendOtpSms(phone: string, code: string): Promise<SendSmsRe
   throw new SmsProviderError(
     "sendOtpSms is not wired to a real SMS vendor. Set one up (MSG91/Twilio/" +
       "TextLocal) and implement the request here - see this file's header " +
-      "for an example shape. Currently only NODE_ENV=development is " +
-      "supported (logs the code instead of sending it)."
+      "for an example shape. Or set ALLOW_SMS_DEV_ECHO=true to keep testing " +
+      "without one for now."
   );
 }
