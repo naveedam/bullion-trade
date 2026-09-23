@@ -1,46 +1,40 @@
 import { NextRequest, NextResponse } from "next/server";
 import Decimal from "decimal.js";
-import Redis from "ioredis";
-import { RateLockManager, RateLockError } from "../../../lib/rateLock";
-// import { getLatestTick } from "../../../lib/tickCache";
-// import { prisma } from "../../../lib/db";
-
-const redis = new Redis(process.env.REDIS_URL ?? "redis://localhost:6379");
-
-const lockManager = new RateLockManager({
-  redis,
-  getQuotedRatePerGram: async (_quoteId, _metal) => {
-    // Replace with a real lookup against the live tick cache (e.g. Redis
-    // hash updated by the WebSocket ingestion service) keyed by quoteId.
-    // Throwing here deliberately until wired, so a misconfigured deploy
-    // fails loudly instead of quoting a stale placeholder price.
-    throw new Error("getQuotedRatePerGram not wired to the live tick cache");
-  },
-  persistAudit: async (record) => {
-    // await prisma.rateLockAudit.create({ data: { ... } });
-    void record;
-  },
-});
+import { RateLockError } from "../../../lib/rateLock";
+import { getLockManager } from "../../../lib/rateLockService";
+import { RedisNotConfiguredError } from "../../../lib/redis";
+import { getSession } from "../../../lib/auth/session";
 
 export async function POST(req: NextRequest) {
+  // userId is NEVER trusted from the request body — it comes from the
+  // verified session only. Previously this route trusted whatever userId
+  // the client claimed to be, which meant anyone could lock rates (and, if
+  // order confirmation had been wired to it, place orders) as anyone else.
+  const session = await getSession(req);
+  if (!session) {
+    return NextResponse.json(
+      { error: "Not logged in — request and verify an OTP first" },
+      { status: 401 }
+    );
+  }
+
   const body = await req.json();
-  const { userId, metal, volumeGrams, quoteId } = body as {
-    userId: string;
+  const { metal, volumeGrams, quoteId } = body as {
     metal: "GOLD" | "SILVER";
     volumeGrams: string;
     quoteId: string;
   };
 
-  if (!userId || !metal || !volumeGrams || !quoteId) {
+  if (!metal || !volumeGrams || !quoteId) {
     return NextResponse.json(
-      { error: "userId, metal, volumeGrams, quoteId are all required" },
+      { error: "metal, volumeGrams, quoteId are all required" },
       { status: 400 }
     );
   }
 
   try {
-    const result = await lockManager.acquireLock({
-      userId,
+    const result = await getLockManager().acquireLock({
+      userId: session.userId,
       metal,
       volumeGrams: new Decimal(volumeGrams),
       quoteId,
@@ -56,6 +50,9 @@ export async function POST(req: NextRequest) {
       ttlMs: result.ttlMs,
     });
   } catch (err) {
+    if (err instanceof RedisNotConfiguredError) {
+      return NextResponse.json({ error: err.message }, { status: 503 });
+    }
     if (err instanceof RateLockError) {
       const statusByCode: Record<string, number> = {
         QUOTE_EXPIRED: 409,

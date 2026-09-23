@@ -1,8 +1,11 @@
 # Bullion Trading Platform — Core Scaffold
 
-A B2B wholesale bullion (gold/silver) trading platform for the Indian market:
-pre-funded virtual-account clearing, a 30-second rate-lock engine, and
-automated delta-hedging against MCX gold futures.
+A B2B bullion (gold/silver) price-lock platform for Bangalore's wholesale
+jewellery trade — replacing phone/WhatsApp price-locking between suppliers
+and Raja Market/Chickpet retailers with a transparent, instantly-lockable
+rate. No brokerage or order-execution role: the platform quotes and locks
+prices, then a bank transfer settles the trade (pre-funded virtual-account
+clearing, a 30-second rate-lock engine).
 
 ## What's here
 
@@ -15,6 +18,36 @@ src/lib/pricing.ts             Dynamic spot → ask-price calculator.
                                 Decimal-safe (decimal.js), GST (3%) and
                                 Section 206C(1H) TCS handling.
 
+src/lib/marketFeed.ts          Live international spot (gold-api.com,
+                                free/no-key) and USD/INR (open.er-api.com,
+                                free/no-key, daily) with a Redis
+                                pull-through cache and stale-fallback so a
+                                provider hiccup degrades gracefully instead
+                                of 500ing the quote board. Feeds the drift
+                                calculation in tickService.ts and the
+                                LBMA+FX fallback mode.
+
+src/lib/ibja.ts                The pricing anchor — India Bullion and
+                                Jewellers Association's published gold/
+                                silver rate, the benchmark the Indian
+                                bullion trade actually references. NOT
+                                wired to a real provider yet — see the file
+                                header and the "What's live" section below.
+
+src/lib/tickService.ts         The actual pricing engine: takes the IBJA
+                                anchor and drifts it live using how much
+                                marketFeed.ts's international price has
+                                moved since the anchor was captured, so the
+                                display keeps moving between IBJA's
+                                periodic republishes. Falls back to a plain
+                                LBMA+FX reconstruction if IBJA fails
+                                outright. Caches the resulting tick under
+                                both a "current per metal" key (for
+                                /api/tick's polling) and a "per quoteId"
+                                key kept slightly longer than the lock
+                                window (for rate-lock to resolve exactly
+                                what was quoted).
+
 src/lib/rateLock.ts            Redis-backed 30-second distributed lock.
                                 acquireLock() / commitLock() with atomic
                                 compare-and-delete to prevent race conditions
@@ -24,15 +57,25 @@ src/lib/webhook.ts             Bank settlement webhook ingestion: HMAC
                                 verification, replay protection, VAN +
                                 amount reconciliation, order state advance.
 
-src/lib/hedging.ts             Delta-hedging trigger. Broker-agnostic
+src/lib/hedging.ts              NOT currently used by any active code
+                                path — the platform doesn't place orders
+                                or hedge exposure (see business decision
+                                above). Kept in the repo, self-contained,
+                                in case that changes. Broker-agnostic
                                 interface (HedgeBroker) + a Kite Connect
-                                adapter (secondary/fallback). Greedy
-                                lot-decomposition across Gold Petal / Gold
-                                Mini / Gold 1kg. Also holds the fill-poller
-                                (pollAndReconcileHedgeFills) that reconciles
-                                broker fills back onto HedgingPosition rows.
+                                adapter. Greedy lot-decomposition across
+                                Gold Petal / Gold Mini / Gold 1kg. Also
+                                holds the fill-poller
+                                (pollAndReconcileHedgeFills).
 
-src/lib/kotak/                 Kotak Neo — the primary hedging broker.
+src/lib/kotak/                  Kotak Neo integration — also NOT wired
+                                 into any active code path currently (see
+                                 above). Left intact and working (verified
+                                 against OptionPal Pro's real
+                                 implementation — see git history / prior
+                                 discussion for what's confirmed vs.
+                                 inferred) in case hedging becomes
+                                 relevant later.
   neoAuth.ts                     2-step login (password + TOTP via
                                   otplib), Redis-cached bearer/sid session,
                                   login-storm protection, health-check ping.
@@ -122,6 +165,100 @@ src/components/, src/app/trading/
   is written to fail loudly (typed errors, no silent fallthrough) precisely
   so a wrong assumption here surfaces in staging, not as a phantom
   unhedged position in production.
+
+## What's actually live now vs. still simulated
+
+- **Live**: `/api/tick`, `/api/rate-lock` (real Redis lock, resolved against
+  the exact quoteId that was ticked).
+- **Auth: phone + OTP, real session, real security fix.** `/api/auth/
+  request-otp` and `/api/auth/verify-otp` implement the full flow — OTP
+  hashed and stored in Redis (never plaintext), 60s resend cooldown,
+  5-attempt cap, session issued as a signed JWT in an httpOnly cookie. All
+  of this was smoke-tested directly (happy path, replay rejection,
+  cooldown enforcement, attempt limiting, tampered-token rejection — see
+  git history / prior conversation for the test output). First-time login
+  auto-creates a minimal `Entity` (KYC `PENDING`) + `User`.
+  **Real security fix included**: `/api/rate-lock` previously trusted
+  whatever `userId` the client sent in the request body — anyone could
+  impersonate anyone. It now derives the user from the verified session
+  only.
+- **Order confirmation is real.** `/api/orders/confirm` commits the Redis
+  lock (atomically, so it can't be double-spent), checks the entity's KYC
+  is `VERIFIED`, and creates a genuine `Order` + `VirtualAccount` +
+  `LogisticsRecord` in Postgres via a single Prisma transaction. The VAN
+  issued is a **platform-generated placeholder**, not a real bank-issued
+  virtual account — there's no partner bank integration (ICICI/HDFC/Axis
+  e-Collection) behind it yet. That's flagged in the code, not silently
+  faked.
+- **No KYC review workflow exists yet.** Every new signup starts
+  `PENDING` and there's no admin UI to approve them — `POST
+  /api/admin/verify-entity` (protected by `ADMIN_SECRET`) is the minimal
+  manual lever to unblock testing the confirm-order flow, not a real
+  admin panel. Building actual KYC review (document upload, approval
+  queue) is separate, real work.
+- **SMS delivery is not wired to a real vendor.** `src/lib/auth/sms.ts`
+  logs the OTP to the server console and echoes it in the API response in
+  development — that's how the smoke test above worked without a real
+  SMS account. In production it throws with a clear message rather than
+  guess at MSG91/Twilio/TextLocal's exact API shape unverified, same
+  policy as everywhere else in this build that's touched an unverified
+  third-party endpoint.
+- **A note on verification limits for this update specifically**: my
+  sandbox's network allowlist blocks `binaries.prisma.sh`, so I could not
+  run `prisma generate` or `prisma validate` here — meaning the
+  auth/order-confirm code was typechecked against Prisma's pre-generation
+  placeholder client (which types everything `any`), not the real
+  schema-specific generated types. I did a careful manual line-by-line
+  review of every Prisma call against the schema instead, and caught one
+  real bug this way (a `string | undefined` passed where Prisma requires
+  a definite `string` in `admin/verify-entity`, now fixed with an explicit
+  guard). Run `npm install && npx prisma generate` yourself before
+  deploying to get a real compiler check — my sandbox's restriction won't
+  apply to yours.
+- **Pricing model, per the platform's business decision** (a B2B price-lock
+  platform for Bangalore's bullion trade — not a brokerage, no order
+  execution): both GOLD and SILVER price off an **IBJA anchor with live
+  drift**. The anchor is India Bullion and Jewellers Association's
+  published rate — the benchmark the formal Indian bullion trade actually
+  references — refreshed every few hours. Between refreshes, the anchor is
+  scaled by how much the international spot+FX price has moved since it
+  was captured, so the displayed price keeps moving in real time without
+  ever floating disconnected from the trade's actual reference rate. See
+  `tickService.ts`'s file header for the exact math. If IBJA fails
+  outright, gold and silver both fall back to the plain LBMA+FX
+  reconstruction — `TickSnapshot.priceSource` always records which mode
+  priced a given tick.
+- **`src/lib/ibja.ts` is the one unwired piece** — there's no single
+  obvious free IBJA source the way gold-api.com/open.er-api.com were for
+  international spot. `fetchIbjaFromProvider` throws with a clear message
+  until you pick a provider (a licensed API like indiagoldratesapi.com, or
+  a RapidAPI-hosted listing) and implement its real request/response
+  shape — the file header has the contract and an example. Everything
+  downstream (the anchor caching, drift math, fallback) is built and
+  smoke-tested against simulated IBJA data already; wiring a real provider
+  in is the only remaining step for this to be genuinely live end to end.
+- **Kotak Neo / MCX (`src/lib/kotak/`) is no longer in the pricing path.**
+  Left in the repo untouched, in case hedging becomes relevant later, but
+  `tickService.ts` doesn't call it — the business doesn't place orders or
+  need a broker account, so it made no sense to keep MCX-via-Kotak as the
+  primary price source. If this ever changes, `mcxPricingService.ts` is
+  still there and was working (see its own commit history / prior
+  conversation) — it would just need re-wiring into `tickService.ts`.
+- **Still simulated / hardcoded**: nothing left in the core quote-to-order
+  flow at this point — the remaining gaps are the ones named above
+  (KYC review, real bank VAN issuance, real SMS vendor, real IBJA
+  provider), each flagged in its own file rather than silently faked.
+- **Requires `REDIS_URL` to actually work.** Rate-lock, the tick cache, and
+  OTP storage all depend on Redis — without it, the relevant routes fail
+  with a clear `RedisNotConfiguredError` message (503) rather than a
+  generic 500. If using Upstash: copy the `rediss://` (TLS) connection
+  string specifically, not the `https://` REST API URL and not the
+  `redis-cli --tls -u ...` command Upstash shows by default — only the
+  `rediss://...` portion is the actual value `REDIS_URL` needs.
+- **Requires `DATABASE_URL` and `AUTH_JWT_SECRET`** for auth and order
+  confirmation to work — see `.env.example`. Run
+  `npx prisma migrate dev` (or `prisma db push` for a quick first pass)
+  against your Postgres instance before testing login.
 
 ## Wiring to Prisma
 

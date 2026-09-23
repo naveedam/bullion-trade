@@ -23,13 +23,13 @@
  *     verify this against your account documentation before flipping it in
  *     production.
  *
- * As with neoAuth.ts and instrumentResolver.ts, the exact order-placement
- * and order-report endpoint paths/response fields below follow Kotak Neo's
- * general API shape but must be checked against your credential bundle's
- * current documentation — this adapter fails loudly (typed errors, no
- * silent `undefined` fallthrough) specifically so a stale endpoint
- * assumption surfaces immediately in staging rather than as a phantom
- * unhedged position in production.
+ * As with neoAuth.ts and instrumentResolver.ts, the order-placement payload
+ * and headers below are now verified against OptionPal Pro's working
+ * kotak-place-order implementation (real field codes: am/dq/es/mp/pc/pf/
+ * pr/pt/qt/rt/tp/ts/tt/tk — not the readable names the first draft of this
+ * file guessed at). `pollFill` remains unverified — OptionPal Pro's working
+ * code never implements fill polling, so that one endpoint is still an
+ * educated inference from the same API family, flagged inline below.
  */
 
 import Decimal from "decimal.js";
@@ -47,9 +47,9 @@ const CONTRACT_CODE_TO_HEDGE_TYPE: Record<string, HedgeContractType> = {
 };
 
 const AMO_QUEUE_KEY = "kotak:neo:amo-queue"; // Redis sorted set, score = scheduled epoch ms
+const ORDER_PLACE_PATH = "Orders/2.0/quick/order/rule/ms/place";
 
 export interface KotakNeoAdapterConfig {
-  baseUrl?: string;
   useNativeAmo?: boolean;
   marketHours: McxMarketHoursConfig;
 }
@@ -72,16 +72,13 @@ export class KotakOrderError extends Error {
 
 export class KotakNeoHedgeAdapter implements HedgeBroker {
   readonly name = "KOTAK_NEO";
-  private readonly baseUrl: string;
 
   constructor(
     private readonly auth: KotakNeoAuthClient,
     private readonly instruments: InstrumentResolver,
     private readonly redis: Redis,
     private readonly config: KotakNeoAdapterConfig
-  ) {
-    this.baseUrl = config.baseUrl ?? "https://gw-napi.kotaksecurities.com";
-  }
+  ) {}
 
   async placeMarketOrder(args: {
     contractCode: string;
@@ -181,26 +178,40 @@ export class KotakNeoHedgeAdapter implements HedgeBroker {
 
     const session = await this.auth.getValidSession();
 
+    // Field codes and header shape verified against OptionPal Pro's working
+    // kotak-place-order function — real Kotak Neo order payloads use short,
+    // broker-internal field codes, not readable names. `st` (strike) and
+    // `ot` (option type) are options-only fields and are correctly omitted
+    // here since MCX gold futures don't have them. Everything else in this
+    // payload carries over from the verified options order — NOT
+    // independently confirmed for MCX futures specifically, since
+    // OptionPal Pro only ever traded NSE F&O options. Smoke-test with a
+    // single 1-lot order before trusting this in the live hedge path.
     let response: Response;
     try {
-      response = await fetch(`${this.baseUrl}/Orders/2.0/quick/order/rule/ms/place`, {
+      response = await fetch(`${session.tradingBaseUrl}/${ORDER_PLACE_PATH}`, {
         method: "POST",
         headers: {
-          Authorization: `Bearer ${session.bearerToken}`,
-          sid: session.sid,
+          Authorization: `Bearer ${session.accessToken}`,
           "Content-Type": "application/json",
+          sid: session.sid,
+          "neo-fin-key": "neotradeapi",
         },
         body: JSON.stringify({
-          exchangeSegment: instrument.exchangeSegment,
-          tradingSymbol: instrument.tradingSymbol,
-          instrumentToken: instrument.instrumentToken,
-          transactionType: args.side,
-          quantity: String(args.lots),
-          orderType: "MKT",
-          product: "NRML",
-          validity: "DAY",
-          amo: "NO",
-          tag: args.clientOrderTag,
+          am: "NO", // AMO flag — always "NO" here; after-hours legs never reach this call (see enqueueForMarketOpen)
+          dq: "0", // disclosed quantity
+          es: instrument.exchangeSegment, // "mcx_fo"
+          mp: "0", // market protection %
+          pc: "NRML", // product code — carry positions, not intraday
+          pf: "N",
+          pr: "0", // price — 0 for market orders
+          pt: "MKT", // order type
+          qt: String(args.lots), // UNCONFIRMED for futures: may want lots, or lots × lotSize (units). Verify against a real 1-lot test order.
+          rt: "DAY", // validity
+          tp: "0", // trigger price
+          ts: instrument.tradingSymbol,
+          tt: args.side === "SELL" ? "S" : "B",
+          ...(instrument.instrumentToken ? { tk: instrument.instrumentToken } : {}),
         }),
       });
     } catch (err) {
@@ -213,18 +224,24 @@ export class KotakNeoHedgeAdapter implements HedgeBroker {
       };
     }
 
-    const body = (await response.json().catch(() => null)) as {
-      stat?: string;
-      nOrdNo?: string;
-      rejReason?: string;
-    } | null;
+    const text = await response.text();
+    let body: { stat?: string; nOrdNo?: string; errMsg?: string; message?: string; error?: string } | null;
+    try {
+      body = JSON.parse(text);
+    } catch {
+      return {
+        brokerOrderId: "",
+        status: "REJECTED",
+        errorDetail: `Non-JSON order response: HTTP ${response.status}: ${text.slice(0, 200)}`,
+      };
+    }
 
-    if (!response.ok || !body || body.stat !== "Ok" || !body.nOrdNo) {
+    if (!response.ok || !body?.nOrdNo) {
       return {
         brokerOrderId: "",
         status: "REJECTED",
         errorDetail:
-          body?.rejReason ?? `Order placement failed: HTTP ${response.status}`,
+          body?.errMsg ?? body?.message ?? body?.error ?? `Order placement failed: HTTP ${response.status}`,
       };
     }
 
@@ -238,10 +255,15 @@ export class KotakNeoHedgeAdapter implements HedgeBroker {
   }
 
   /**
-   * Polls a single order for terminal fill status. Call from a scheduled
-   * job for every HedgingPosition in SUBMITTED/OPEN state until it reaches
-   * a terminal status (TRAD or REJ), then persist avgPrice/charges and
-   * advance or flag the parent Order accordingly.
+   * Polls a single order for terminal fill status.
+   *
+   * UNVERIFIED — OptionPal Pro's working code never implements fill
+   * polling (it records the order id from placement and stops there; P&L
+   * tracking there works some other way, not via this endpoint). The path
+   * and field names below are inferred from the same "Orders/2.0" family
+   * as the verified order-placement call, not independently confirmed.
+   * Treat this function as the same category of risk the original draft
+   * of this file was — test against a real order before trusting it.
    */
   async pollFill(brokerOrderId: string): Promise<KotakFillResult> {
     const session = await this.auth.getValidSession();
@@ -249,13 +271,14 @@ export class KotakNeoHedgeAdapter implements HedgeBroker {
     let response: Response;
     try {
       response = await fetch(
-        `${this.baseUrl}/Orders/2.0/quick/order-report?nOrdNo=${encodeURIComponent(
+        `${session.tradingBaseUrl}/Orders/2.0/quick/order-report?nOrdNo=${encodeURIComponent(
           brokerOrderId
         )}`,
         {
           headers: {
-            Authorization: `Bearer ${session.bearerToken}`,
+            Authorization: `Bearer ${session.accessToken}`,
             sid: session.sid,
+            "neo-fin-key": "neotradeapi",
           },
         }
       );
@@ -270,7 +293,7 @@ export class KotakNeoHedgeAdapter implements HedgeBroker {
     }
 
     const body = (await response.json().catch(() => null)) as {
-      ordSt?: string; // e.g. "complete" | "open" | "rejected" | "cancelled"
+      ordSt?: string;
       avgPrc?: string;
       fldQty?: string;
       chrges?: string;
